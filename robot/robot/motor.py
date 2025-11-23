@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RB-35GM 11TYPE (Encoder 26P/R) + 감속비 고려
+motor.py
+- RB-35GM 11TYPE (Encoder 26P/R) + 감속비 고려
 - 라즈베리파이4 + Ubuntu 22.04 + ROS 2 Humble
-- RPi.GPIO 사용
-- 쿼드러처 X4 디코딩 엔코더
-- /cmd_vel 기반 속도 명령
-- 엔코더 + PID로 바퀴 속도 제어
-- /imu/data 구독해서 pitch 기반 경사 보정(feed-forward) 옵션
+- RPi.GPIO + ROS2 Node
+- /cmd_vel 기반으로 좌우 바퀴 속도 제어
+- 평지에서는 base_pwm로 주행, 경사에서는 PID로 평지 기준 속도 유지
 """
 
-import RPi.GPIO as GPIO
-import time
 import math
 from threading import Lock
+
+import RPi.GPIO as GPIO
 
 import rclpy
 from rclpy.node import Node
@@ -113,74 +112,95 @@ class RB35DriverNode(Node):
         super().__init__('motor')
 
         # ===== 파라미터 =====
-        self.declare_parameter('control_hz', 50.0)       # PID 주기 [Hz]
-        self.declare_parameter('base_pwm', 20.0)         # 최소 구동 PWM
-        self.declare_parameter('max_pwm', 100.0)         # 최대 PWM
-        self.declare_parameter('kp', 100.0)
-        self.declare_parameter('ki', 0.0)
+        self.declare_parameter('control_hz', 50.0)        # 제어 주기 [Hz]
+        self.declare_parameter('base_pwm', 30.0)          # 평지 기본 PWM[%]
+        self.declare_parameter('max_pwm_left', 100.0)     # 왼쪽 최대 PWM
+        self.declare_parameter('max_pwm_right', 60.0)     # 오른쪽 최대 PWM (조금 작은 값)
+        self.declare_parameter('kp', 300.0)
+        self.declare_parameter('ki', 5.0)
         self.declare_parameter('kd', 0.0)
-        self.declare_parameter('debug', False)
-        self.declare_parameter('use_imu_pitch_ff', False)
-        self.declare_parameter('pitch_k', 0.0)           # 경사 feed-forward gain
+        self.declare_parameter('pitch_slope_deg', 3.0)    # 이 각도 이상이면 경사
+        self.declare_parameter('flat_speed_alpha', 0.1)   # 평지 속도 EMA 계수
+        self.declare_parameter('debug', True)
 
-        control_hz = float(self.get_parameter('control_hz').value)
-        self.base_pwm = float(self.get_parameter('base_pwm').value)
-        self.max_pwm = float(self.get_parameter('max_pwm').value)
-        kp = float(self.get_parameter('kp').value)
-        ki = float(self.get_parameter('ki').value)
-        kd = float(self.get_parameter('kd').value)
-        self.debug = bool(self.get_parameter('debug').value)
-        self.use_imu_pitch_ff = bool(self.get_parameter('use_imu_pitch_ff').value)
-        self.pitch_k = float(self.get_parameter('pitch_k').value)
+        control_hz       = float(self.get_parameter('control_hz').value)
+        self.base_pwm    = float(self.get_parameter('base_pwm').value)
+        self.max_pwm_L   = float(self.get_parameter('max_pwm_left').value)
+        self.max_pwm_R   = float(self.get_parameter('max_pwm_right').value)
+        kp               = float(self.get_parameter('kp').value)
+        ki               = float(self.get_parameter('ki').value)
+        kd               = float(self.get_parameter('kd').value)
+        pitch_slope_deg  = float(self.get_parameter('pitch_slope_deg').value)
+        self.flat_alpha  = float(self.get_parameter('flat_speed_alpha').value)
+        self.debug       = bool(self.get_parameter('debug').value)
 
         self.dt = 1.0 / control_hz
+        self.pitch_thresh_rad = math.radians(pitch_slope_deg)
 
-        self.get_logger().info(f"RB35DriverNode started (control_hz={control_hz})")
         self.get_logger().info(
-            f"TICKS_PER_REV={TICKS_PER_REV}, wheel_circ={WHEEL_CIRCUMFERENCE:.4f} m"
+            f"RB35DriverNode started (control_hz={control_hz})"
+        )
+        self.get_logger().info(
+            f"TICKS_PER_REV={TICKS_PER_REV}, wheel_circ={WHEEL_CIRCUMFERENCE:.4f} m, "
+            f"base_pwm={self.base_pwm}%, max_pwm_L/R={self.max_pwm_L}/{self.max_pwm_R}"
         )
 
         # ===== 내부 상태 =====
         self.encoder_lock = Lock()
         self.m1_count = 0
         self.m2_count = 0
-        self.m1_count_prev = 0
-        self.m2_count_prev = 0
+        self.m1_prev_count = 0
+        self.m2_prev_count = 0
         self.m1_dir = 0
         self.m2_dir = 0
-
         self.m1_prev_a = 0
         self.m1_prev_b = 0
         self.m2_prev_a = 0
         self.m2_prev_b = 0
 
-        self.target_v = 0.0     # [m/s]
-        self.target_w = 0.0     # [rad/s]
+        # /cmd_vel에서 오는 목표 속도
+        self.target_v = 0.0
+        self.target_w = 0.0
         self.target_v_left = 0.0
         self.target_v_right = 0.0
 
+        # 실제 속도
         self.meas_v_left = 0.0
         self.meas_v_right = 0.0
 
+        # PWM 출력
         self.pwm_left = 0.0
         self.pwm_right = 0.0
 
-        self.last_pitch = None  # [rad]
+        # IMU pitch
+        self.last_pitch = None
 
-        self.pid_left = PID(kp, ki, kd, out_min=0.0, out_max=self.max_pwm - self.base_pwm)
-        self.pid_right = PID(kp, ki, kd, out_min=0.0, out_max=self.max_pwm - self.base_pwm)
+        # 평지 기준 속도 (base_pwm에서의 속도)
+        self.flat_v_left_ref = 0.0
+        self.flat_v_right_ref = 0.0
+        self.flat_ref_initialized = False
+
+        # PID
+        self.pid_left = PID(kp, ki, kd,
+                            out_min=0.0,
+                            out_max=self.max_pwm_L - self.base_pwm)
+        self.pid_right = PID(kp, ki, kd,
+                             out_min=0.0,
+                             out_max=self.max_pwm_R - self.base_pwm)
 
         # GPIO 세팅
         self.setup_gpio()
 
         # ROS 통신
-        self.cmd_sub = self.create_subscription(Twist, 'cmd_vel', self.cmd_vel_callback, 10)
-        self.imu_sub = self.create_subscription(Imu, '/imu/data', self.imu_callback, 10)
+        self.cmd_sub = self.create_subscription(Twist, 'cmd_vel',
+                                                self.cmd_vel_callback, 10)
+        self.imu_sub = self.create_subscription(Imu, '/imu/data',
+                                                self.imu_callback, 10)
 
         # 제어 루프 타이머
         self.control_timer = self.create_timer(self.dt, self.control_loop)
 
-    # ===== GPIO 초기화 =====
+    # ---------- GPIO / 엔코더 ----------
     def setup_gpio(self):
         GPIO.setmode(GPIO.BOARD)
         GPIO.setwarnings(False)
@@ -207,10 +227,14 @@ class RB35DriverNode(Node):
         self.m2_prev_a = GPIO.input(MOTOR2_HALL_A)
         self.m2_prev_b = GPIO.input(MOTOR2_HALL_B)
 
-        GPIO.add_event_detect(MOTOR1_HALL_A, GPIO.BOTH, callback=self.motor1_callback, bouncetime=1)
-        GPIO.add_event_detect(MOTOR1_HALL_B, GPIO.BOTH, callback=self.motor1_callback, bouncetime=1)
-        GPIO.add_event_detect(MOTOR2_HALL_A, GPIO.BOTH, callback=self.motor2_callback, bouncetime=1)
-        GPIO.add_event_detect(MOTOR2_HALL_B, GPIO.BOTH, callback=self.motor2_callback, bouncetime=1)
+        GPIO.add_event_detect(MOTOR1_HALL_A, GPIO.BOTH,
+                              callback=self.motor1_callback, bouncetime=1)
+        GPIO.add_event_detect(MOTOR1_HALL_B, GPIO.BOTH,
+                              callback=self.motor1_callback, bouncetime=1)
+        GPIO.add_event_detect(MOTOR2_HALL_A, GPIO.BOTH,
+                              callback=self.motor2_callback, bouncetime=1)
+        GPIO.add_event_detect(MOTOR2_HALL_B, GPIO.BOTH,
+                              callback=self.motor2_callback, bouncetime=1)
 
         GPIO.output(MOTOR1_EN, GPIO.LOW)
         GPIO.output(MOTOR2_EN, GPIO.LOW)
@@ -219,38 +243,34 @@ class RB35DriverNode(Node):
 
         self.get_logger().info("GPIO initialized (BOARD mode)")
 
-    # ===== 엔코더 콜백 =====
     def motor1_callback(self, channel):
         curr_a = GPIO.input(MOTOR1_HALL_A)
         curr_b = GPIO.input(MOTOR1_HALL_B)
-        delta, direction = decode_x4(self.m1_prev_a, self.m1_prev_b, curr_a, curr_b)
-
+        delta, direction = decode_x4(self.m1_prev_a, self.m1_prev_b,
+                                     curr_a, curr_b)
         if delta:
             with self.encoder_lock:
                 self.m1_count += 1
                 self.m1_dir = direction
-
         self.m1_prev_a = curr_a
         self.m1_prev_b = curr_b
 
     def motor2_callback(self, channel):
         curr_a = GPIO.input(MOTOR2_HALL_A)
         curr_b = GPIO.input(MOTOR2_HALL_B)
-        delta, direction = decode_x4(self.m2_prev_a, self.m2_prev_b, curr_a, curr_b)
-
+        delta, direction = decode_x4(self.m2_prev_a, self.m2_prev_b,
+                                     curr_a, curr_b)
         if delta:
             with self.encoder_lock:
                 self.m2_count += 1
                 self.m2_dir = direction
-
         self.m2_prev_a = curr_a
         self.m2_prev_b = curr_b
 
-    # ===== ROS 콜백 =====
+    # ---------- ROS 콜백 ----------
     def cmd_vel_callback(self, msg: Twist):
         self.target_v = msg.linear.x
         self.target_w = msg.angular.z
-
         self.target_v_left  = self.target_v - self.target_w * (WHEEL_BASE / 2.0)
         self.target_v_right = self.target_v + self.target_w * (WHEEL_BASE / 2.0)
 
@@ -258,103 +278,165 @@ class RB35DriverNode(Node):
         q = msg.orientation
         w, x, y, z = q.w, q.x, q.y, q.z
 
-        sinr_cosp = 2.0 * (w * x + y * z)
-        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-        _roll = math.atan2(sinr_cosp, cosr_cosp)
-
         sinp = 2.0 * (w * y - z * x)
         if abs(sinp) >= 1.0:
             pitch = math.copysign(math.pi / 2.0, sinp)
         else:
             pitch = math.asin(sinp)
-
         self.last_pitch = pitch
 
-    # ===== 제어 루프 =====
+    # ---------- 제어 루프 ----------
     def control_loop(self):
+        # 1) 엔코더로 현재 속도 계산
         with self.encoder_lock:
             m1 = self.m1_count
             m2 = self.m2_count
-            dir1 = self.m1_dir
-            dir2 = self.m2_dir
+            d1 = self.m1_dir
+            d2 = self.m2_dir
 
-        delta1 = m1 - self.m1_count_prev
-        delta2 = m2 - self.m2_count_prev
-        self.m1_count_prev = m1
-        self.m2_count_prev = m2
+        delta1 = m1 - self.m1_prev_count
+        delta2 = m2 - self.m2_prev_count
+        self.m1_prev_count = m1
+        self.m2_prev_count = m2
 
         rev1 = delta1 / TICKS_PER_REV / self.dt
         rev2 = delta2 / TICKS_PER_REV / self.dt
 
-        self.meas_v_left  = rev1 * WHEEL_CIRCUMFERENCE * (1 if dir1 >= 0 else -1)
-        self.meas_v_right = rev2 * WHEEL_CIRCUMFERENCE * (1 if dir2 >= 0 else -1)
+        self.meas_v_left  = rev1 * WHEEL_CIRCUMFERENCE * (1 if d1 >= 0 else -1)
+        self.meas_v_right = rev2 * WHEEL_CIRCUMFERENCE * (1 if d2 >= 0 else -1)
 
-        cmd_left_mag  = self.pid_left.update(self.target_v_left,  self.meas_v_left,  self.dt)
-        cmd_right_mag = self.pid_right.update(self.target_v_right, self.meas_v_right, self.dt)
+        # 2) 경사 여부
+        slope_mode = False
+        if self.last_pitch is not None and \
+           abs(self.last_pitch) >= self.pitch_thresh_rad:
+            slope_mode = True
 
-        pwm_left  = self.base_pwm + cmd_left_mag
-        pwm_right = self.base_pwm + cmd_right_mag
+        if self.debug and self.last_pitch is not None:
+            self.get_logger().info(
+                f"[IMU] pitch={math.degrees(self.last_pitch):.2f} deg"
+            )
 
-        if pwm_left > self.max_pwm:
-            pwm_left = self.max_pwm
-        if pwm_right > self.max_pwm:
-            pwm_right = self.max_pwm
+        # === cmd_vel이 거의 0 이면 완전 정지 ===
+        if abs(self.target_v) < 1e-3 and abs(self.target_w) < 1e-3:
+            self.pwm_left = 0.0
+            self.pwm_right = 0.0
+            self.apply_motor_output(0.0, 0.0)
+            if self.debug:
+                self.get_logger().info("[STOP] cmd_vel ~ 0 -> PWM=0")
+            return
 
-        # IMU pitch 기반 feed-forward (옵션)
-        if self.use_imu_pitch_ff and self.last_pitch is not None:
-            slope_term = self.pitch_k * math.sin(self.last_pitch)
-            sign_left  = 1.0 if self.target_v_left  >= 0.0 else -1.0
-            sign_right = 1.0 if self.target_v_right >= 0.0 else -1.0
-            pwm_left  += slope_term * sign_left
-            pwm_right += slope_term * sign_right
-            pwm_left  = max(0.0, min(self.max_pwm, pwm_left))
-            pwm_right = max(0.0, min(self.max_pwm, pwm_right))
+        # === 평지 모드: base_pwm로만 주행 + 기준 속도 학습 ===
+        if not slope_mode:
+            self.pid_left.reset()
+            self.pid_right.reset()
+
+            # 방향은 target_v_left/right 부호만 사용
+            dirL = 1.0 if self.target_v_left  >= 0.0 else -1.0
+            dirR = 1.0 if self.target_v_right >= 0.0 else -1.0
+
+            self.pwm_left = self.base_pwm
+            self.pwm_right = self.base_pwm
+            self.apply_motor_output(dirL, dirR)
+
+            vL_abs = abs(self.meas_v_left)
+            vR_abs = abs(self.meas_v_right)
+
+            if vL_abs > 1e-3:
+                if not self.flat_ref_initialized:
+                    self.flat_v_left_ref = vL_abs
+                else:
+                    self.flat_v_left_ref = (
+                        (1.0 - self.flat_alpha) * self.flat_v_left_ref +
+                        self.flat_alpha * vL_abs
+                    )
+            if vR_abs > 1e-3:
+                if not self.flat_ref_initialized:
+                    self.flat_v_right_ref = vR_abs
+                else:
+                    self.flat_v_right_ref = (
+                        (1.0 - self.flat_alpha) * self.flat_v_right_ref +
+                        self.flat_alpha * vR_abs
+                    )
+
+            if vL_abs > 1e-3 or vR_abs > 1e-3:
+                self.flat_ref_initialized = True
+
+            if self.debug:
+                self.get_logger().info(
+                    f"[FLAT] vL={self.meas_v_left:.3f}, vR={self.meas_v_right:.3f}, "
+                    f"flat_ref L/R={self.flat_v_left_ref:.3f}/{self.flat_v_right_ref:.3f}, "
+                    f"PWM L/R={self.pwm_left:.1f}/{self.pwm_right:.1f}"
+                )
+            return
+
+        # === 경사 모드: 평지 기준 속도 유지 위해 PID 사용 ===
+        if not self.flat_ref_initialized:
+            self.flat_v_left_ref = abs(self.meas_v_left)
+            self.flat_v_right_ref = abs(self.meas_v_right)
+            self.flat_ref_initialized = True
+
+        dirL = 1.0 if self.target_v_left  >= 0.0 else -1.0
+        dirR = 1.0 if self.target_v_right >= 0.0 else -1.0
+
+        target_vL = dirL * self.flat_v_left_ref
+        target_vR = dirR * self.flat_v_right_ref
+
+        cmdL = self.pid_left.update(target_vL, self.meas_v_left,  self.dt)
+        cmdR = self.pid_right.update(target_vR, self.meas_v_right, self.dt)
+
+        pwm_left  = self.base_pwm + cmdL
+        pwm_right = self.base_pwm + cmdR
+
+        pwm_left  = max(0.0, min(self.max_pwm_L, pwm_left))
+        pwm_right = max(0.0, min(self.max_pwm_R, pwm_right))
 
         self.pwm_left = pwm_left
         self.pwm_right = pwm_right
-
-        self.apply_motor_output(self.target_v_left, self.pwm_left,
-                                self.target_v_right, self.pwm_right)
+        self.apply_motor_output(dirL, dirR)
 
         if self.debug:
             self.get_logger().info(
-                f"vL={self.meas_v_left:.3f}/{self.target_v_left:.3f}  "
-                f"vR={self.meas_v_right:.3f}/{self.target_v_right:.3f}  "
+                f"[SLOPE] pitch={math.degrees(self.last_pitch):.2f} deg | "
+                f"vL={self.meas_v_left:.3f}/{target_vL:.3f}, "
+                f"vR={self.meas_v_right:.3f}/{target_vR:.3f}, "
                 f"PWM L/R={self.pwm_left:.1f}/{self.pwm_right:.1f}"
             )
 
-    def apply_motor_output(self, v_left, pwm_left, v_right, pwm_right):
-        # 왼쪽 모터
-        if abs(v_left) < 1e-3:
+    def apply_motor_output(self, dir_left: float, dir_right: float):
+        # 왼쪽
+        if abs(dir_left) < 1e-3 or self.pwm_left <= 0.0:
             GPIO.output(MOTOR1_EN, GPIO.LOW)
             self.pwm1.ChangeDutyCycle(0.0)
         else:
-            GPIO.output(MOTOR1_EN, GPIO.LOW)  # 보드에 따라 HIGH가 Enable일 수도 있음
-            if v_left >= 0.0:
-                GPIO.output(MOTOR1_DIR, GPIO.LOW)
-            else:
-                GPIO.output(MOTOR1_DIR, GPIO.HIGH)
-            self.pwm1.ChangeDutyCycle(pwm_left)
+            GPIO.output(MOTOR1_EN, GPIO.LOW)  # 보드에 따라 HIGH일 수도 있음
+            GPIO.output(MOTOR1_DIR, GPIO.LOW if dir_left >= 0 else GPIO.HIGH)
+            self.pwm1.ChangeDutyCycle(self.pwm_left)
 
-        # 오른쪽 모터
-        if abs(v_right) < 1e-3:
+        # 오른쪽
+        if abs(dir_right) < 1e-3 or self.pwm_right <= 0.0:
             GPIO.output(MOTOR2_EN, GPIO.LOW)
             self.pwm2.ChangeDutyCycle(0.0)
         else:
             GPIO.output(MOTOR2_EN, GPIO.LOW)
-            if v_right >= 0.0:
-                GPIO.output(MOTOR2_DIR, GPIO.LOW)
-            else:
-                GPIO.output(MOTOR2_DIR, GPIO.HIGH)
-            self.pwm2.ChangeDutyCycle(pwm_right)
+            GPIO.output(MOTOR2_DIR, GPIO.LOW if dir_right >= 0 else GPIO.HIGH)
+            self.pwm2.ChangeDutyCycle(self.pwm_right)
 
-    # ===== 종료 처리 =====
+    # ---------- 종료 처리 ----------
     def cleanup(self):
+        try:
+            GPIO.remove_event_detect(MOTOR1_HALL_A)
+            GPIO.remove_event_detect(MOTOR1_HALL_B)
+            GPIO.remove_event_detect(MOTOR2_HALL_A)
+            GPIO.remove_event_detect(MOTOR2_HALL_B)
+        except Exception:
+            pass
+
         try:
             self.pwm1.stop()
             self.pwm2.stop()
         except Exception:
             pass
+
         GPIO.cleanup()
         self.get_logger().info("GPIO cleaned up")
 
@@ -377,4 +459,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
