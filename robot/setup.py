@@ -24,9 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-        'motor = robot.motor:main',          
+        'motor = robot.motor:main',
+        'teleop = robot.teleop:main',          
         'ximu3_publisher = robot.ximu3_publisher:main',
-        
         ],
     },
 )
